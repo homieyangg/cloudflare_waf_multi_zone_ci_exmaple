@@ -1,26 +1,44 @@
 rules:
-# 第一優先級：阻擋已知惡意 ASN（最具體，基於 IP）
-- action: block
-  expression: (ip.geoip.asnum in {197695 49505 201776 202425 49392 44812 202422 49981
-    60068 44901 51167 200000 208091 202448 63949 16276 24940 45090 37963 20473 14061
-    9009 35913 31034 8100 46844 40676 53667 209605 212238 29802 48693})
-  name: Block Known Bad ASNs (AbuseIPDB)
-
-# 第二優先級：允許核心合法服務（精簡版）
+# 第零優先：放行你自己信任的 IP（最高優先，跳過後面所有 custom rules + 受管產品）。
+# 把下面換成你自己的 server / CI / 監控出口 IP。沒有這條的話，自家流量一旦被下面的
+# ASN / UA 規則掃到就會被擋——這是最常見的「自己把自己鎖在外面」。
+# （203.0.113.x 是 RFC5737 範例網段，記得換掉。）
 - action: skip
-  expression: (cf.client.bot) or (http.user_agent contains "Expanse, a Palo Alto Networks company") or (http.user_agent contains "Shodan") or (http.user_agent contains "Censys") or (http.user_agent contains "UptimeRobot") or (http.user_agent contains "Pingdom") or (http.user_agent contains "Googlebot") or (http.user_agent contains "Bingbot") or (http.user_agent contains "Slurp") or (http.user_agent contains "DuckDuckBot") or (http.user_agent contains "Baiduspider") or (http.user_agent contains "YandexBot") or (http.user_agent contains "facebookexternalhit") or (http.user_agent contains "Twitterbot") or (http.user_agent contains "LinkedInBot") or (http.user_agent contains "WhatsApp") or (http.user_agent contains "Discordbot") or (http.user_agent contains "AppleBot") or (http.user_agent contains "ia_archiver")
+  name: Allow Trusted Infrastructure
+  expression: (ip.src in {203.0.113.10 203.0.113.11})
+  skip_current_ruleset: true
+  products:
+  - waf
+  - bic
+  - rateLimit
+  - securityLevel
+  - uaBlock
+  - zoneLockdown
+  logging_enabled: true
+
+# 第一優先：阻擋已知惡意 ASN。這條的 expression 會被 update_abuseipdb_asns.py 每次跑時
+# 就地重寫（從 AbuseIPDB / 靜態清單），所以這裡放幾個示意值即可。
+- action: block
+  name: Block Known Bad ASNs (AbuseIPDB)
+  expression: (ip.geoip.asnum in {16276 24940 14061 9009})
+
+# 第二優先：放行常見合法服務（只跳過受管產品，後面的 custom block 仍會評估）。
+- action: skip
+  expression: (cf.client.bot) or (http.user_agent contains "Googlebot") or (http.user_agent contains "Bingbot") or (http.user_agent contains "UptimeRobot") or (http.user_agent contains "Pingdom") or (http.user_agent contains "facebookexternalhit") or (http.user_agent contains "Twitterbot") or (http.user_agent contains "LinkedInBot") or (http.user_agent contains "Discordbot") or (http.user_agent contains "AppleBot")
   name: Allow Essential Legitimate Services
   products:
   - waf
   - bic
   - rateLimit
 
-# 第三優先級：阻擋惡意用戶代理和漏洞路徑探測
+# 第三優先：擋掃描工具 UA + 常見漏洞路徑探測。依需要增刪。
 - action: block
-  expression: (http.user_agent contains "HeadlessChrome") or (http.user_agent contains "OPD") or (http.user_agent contains "fasthttp") or (http.user_agent contains "ALittle Client") or (http.user_agent contains "ct‑git‑scanner") or (http.user_agent contains "python-requests") or (http.user_agent contains "curl") or (http.user_agent contains "wget") or (http.user_agent contains "libwww-perl") or (http.user_agent contains "masscan") or (http.user_agent contains "nmap") or (http.user_agent contains "sqlmap") or (http.user_agent contains "nikto") or (http.user_agent contains "ZmEu") or (http.user_agent contains "w3af") or (http.user_agent contains "dirbuster") or (http.user_agent contains "gobuster") or (http.user_agent contains "ffuf") or (http.user_agent contains "wfuzz") or (http.user_agent contains "nuclei") or (http.user_agent contains "httpx") or (http.user_agent contains "subfinder") or (http.user_agent contains "amass") or (http.user_agent contains "zgrab") or (http.user_agent contains "zmap") or (http.user_agent contains "Go-http-client") or (http.user_agent contains "Apache-HttpClient") or (http.user_agent eq "") or (http.request.uri.path contains "/.git") or (http.request.uri.path contains "/.env") or (http.request.uri.path contains "/wp-login") or (http.request.uri.path contains "/wp-admin") or (http.request.uri.path contains "/config.") or (http.request.uri.path contains "/phpinfo") or (http.request.uri.path contains "/shell") or (http.request.uri.path eq "/admin") or (http.request.uri.path eq "/admin/") or (http.request.uri.path contains "/admin.php") or (http.request.uri.path contains "/administrator") or (http.request.uri.path contains "cgi-bin") or (http.request.uri.path contains "/.aws") or (http.request.uri.path contains "/.ssh") or (http.request.uri.path contains "/backup") or (http.request.uri.path contains "/database") or (http.request.uri.path contains "/db_") or (http.request.uri.path contains "/sql") or (http.request.uri.path contains "/phpmyadmin") or (http.request.uri.path contains "/adminer") or (http.request.uri.path contains "/.htaccess") or (http.request.uri.path contains "/.htpasswd") or (http.request.uri.path contains "/web.config") or (http.request.uri.path contains "/composer.json") or (http.request.uri.path contains "/package.json") or (http.request.uri.path contains "/Dockerfile") or (http.request.uri.path contains "/docker-compose") or (http.request.uri.path contains "/.terraform") or (http.request.uri.path contains "/server-status") or (http.request.uri.path contains "/server-info") or (http.request.uri.path contains "/.svn") or (http.request.uri.path contains "/.hg") or (http.request.uri.path contains "/CVS") or (http.request.uri.path contains "/.bzr")
+  expression: (http.user_agent contains "sqlmap") or (http.user_agent contains "nikto") or (http.user_agent contains "nmap") or (http.user_agent contains "masscan") or (http.user_agent contains "nuclei") or (http.user_agent eq "") or (http.request.uri.path contains "/.git") or (http.request.uri.path contains "/.env") or (http.request.uri.path contains "/wp-login") or (http.request.uri.path contains "/phpmyadmin") or (http.request.uri.path contains "/.aws") or (http.request.uri.path contains "/.ssh")
   name: Block Malicious Traffic & Exploit Probes
 
-# 第四優先級：挑戰海外流量（兜底策略）
+# 第四優先（兜底）：高威脅分數的流量丟 managed challenge。
+# 注意：別用「挑戰所有海外流量」那種寫法——對 SPA + API 的站，managed challenge 會卡死
+# 前端的 XHR / preflight，等於把海外用戶整個擋掉。用 threat_score 比較安全。
 - action: managed_challenge
-  expression: not ip.geoip.country in {"CN" "HK" "TW" "MO"}
-  name: Challenge Overseas Traffic
+  expression: (cf.threat_score gt 10)
+  name: Challenge High Threat Score Traffic

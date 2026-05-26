@@ -7,6 +7,11 @@ on:
     branches: [ "main" ]
   workflow_dispatch:  # 允許手動觸發
 
+# 同時間只跑一個，避免 cron 與 push 併發各自 import/apply 撞同一個 ruleset
+concurrency:
+  group: waf-deploy
+  cancel-in-progress: false
+
 jobs:
   deploy-multi-zone:
     runs-on: ubuntu-latest
@@ -17,21 +22,47 @@ jobs:
 
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
     - name: Install Python Dependencies
       run: pip install requests pyyaml
 
-    - name: Update ASN Rules from AbuseIPDB
+    # 更新 rules.yaml 的 ASN 清單 + 探查現有 ruleset 寫出 import_targets.txt
+    - name: Update ASN Rules & Discover Import Targets
       run: python update_abuseipdb_asns.py
 
     - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
+      uses: hashicorp/setup-terraform@v3
       with:
-        terraform_version: 1.6.6
+        terraform_version: "1.9.8"
 
     - name: Terraform Init
-      run: terraform init
+      run: terraform init -input=false
+
+    # in-place onboarding：把每個 zone 現有的 entry-point ruleset import 進當次 state，
+    # 之後 apply 就是 in-place 更新（零無防護空窗）。新 zone 沒有 import 目標 → apply 自行 create。
+    # 已在 state（不會發生在 ephemeral runner）或目標不存在時容忍錯誤。
+    - name: Terraform Import Existing Rulesets
+      run: |
+        if [ ! -s import_targets.txt ]; then
+          echo "No import targets — all zones will be created fresh."
+          exit 0
+        fi
+        while IFS=$'\t' read -r address import_id; do
+          [ -z "$address" ] && continue
+          echo "::group::import $address"
+          terraform import -input=false "$address" "$import_id" \
+            || echo "⚠️  import skipped/failed for $address (may already be managed or not exist)"
+          echo "::endgroup::"
+        done < import_targets.txt
+
+    - name: Terraform Plan
+      run: terraform plan -input=false -no-color
 
     - name: Terraform Apply
-      run: terraform apply -auto-approve
+      run: terraform apply -auto-approve -input=false

@@ -1,228 +1,70 @@
-[中文版本](./README_zh-CN.md)
+# Cloudflare WAF 自動更新（Terraform + AbuseIPDB）
 
-# Cloudflare WAF Auto Update Tool
+用 GitHub Actions 自動幫你的 Cloudflare zone 維護一組 WAF custom rules。
+每天從 AbuseIPDB 抓壞 ASN 更新黑名單，順便放行搜尋引擎 / 監控這類正常服務。
+多個 zone 可以一起管，規則寫在一個 `rules.yaml` 裡。
 
-This tool automatically fetches a list of malicious ASNs from AbuseIPDB and updates your Cloudflare WAF rules to protect your website from malicious traffic while allowing legitimate security scanners and monitoring services.
+## 它怎麼跑
 
-## 🚀 Key Features
+GitHub Actions（每天 03:00 UTC + push main + 手動）會做這幾步：
 
-- **Smart Protection**: Blocks malicious traffic while allowing legitimate services
-- **SEO Friendly**: Supports all major search engines and social media crawlers
-- **Security Scanner Support**: Allows legitimate security scanners (Expanse, Shodan, Censys, etc.)
-- **Monitoring Service Support**: Compatible with uptime monitoring and performance testing tools
-- **Automatic Updates**: Daily updates from AbuseIPDB threat intelligence
-- **Multi-Zone Support**: Manage multiple Cloudflare zones from a single repository
+1. `update_abuseipdb_asns.py` → 更新 `rules.yaml` 的 ASN 清單，順便查出每個 zone 現有的 ruleset id 寫進 `import_targets.txt`
+2. `terraform import` → 把現有 ruleset 拉進 state
+3. `terraform apply` → **in-place 更新**，不會砍掉重建，所以沒有「中間一段沒防護」的空窗
 
-## Usage
+> 早期版本是「先 DELETE 整個 ruleset 再重建」，每天都有短暫空窗、還會把手動改的規則洗掉。現在改成 import → apply，乾淨很多。
 
-### 1. Fork this repository
+## 怎麼用
 
-Click the Fork button in the top right corner to copy this repository to your GitHub account.
+**1. Fork 這個 repo。**
 
-### 2. Set up GitHub Secrets
+**2. 設兩個 GitHub Secret**（Settings → Secrets and variables → Actions）：
 
-In your forked repository, go to Settings > Secrets and variables > Actions, and add the following two secrets:
+| Name | 要幹嘛 |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | **Zone : WAF : Edit** 權限的 API Token。一把 token 只能管它所屬帳號的 zone，別放別帳號的進來。Client IP filtering 留空，不然會擋到 runner。 |
+| `ABUSEIPDB_API_KEY` | 選用。沒設就用內建的靜態 ASN 清單，功能照常。 |
 
-| Name                    | Value                                                     |
-| ---------------------- | -------------------------------------------------------- |
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API Token (requires Zone:Edit and Zone:Read permissions) |
-| `ABUSEIPDB_API_KEY`    | Your AbuseIPDB API Key                                    |
+**3. 改 `terraform.tfvars`**，填你自己的 zone（域名 = zone id，dashboard 該網域 Overview 右下角找得到）：
 
-### 3. Modify terraform.tfvars
-
-Edit the `terraform.tfvars` file and **only** fill in your Cloudflare Zone ID:
-
-```
-# cloudflare_api_token is passed via environment variable TF_VAR_cloudflare_api_token from GitHub Secrets
-# Do not set the API token in this file for improved security
-
+```hcl
 zone_ids = {
-  "example.com" = "your_zone_id_1"
-  "example.org" = "your_zone_id_2"
+  "yourdomain.com" = "你的zone_id"
 }
 ```
 
-**Important Security Note**:
-- ❌ **Do not** set `cloudflare_api_token` in `terraform.tfvars`
-- ✅ The API Token will be automatically passed from `CLOUDFLARE_API_TOKEN` in GitHub Secrets via the environment variable `TF_VAR_cloudflare_api_token`
-- You can find the Zone ID at the bottom of your website's overview page in the Cloudflare dashboard.
+**4. push 上去**，Actions 會自己跑。也可以去 Actions 頁手動 dispatch。
 
-### 4. Commit Changes
+## 改規則
+
+全部在 `rules.yaml`，由上到下就是優先順序。預設五條：
+
+1. **Allow Trusted Infrastructure** — 放行你自己的 IP（server / CI / 監控）。**先把這條的範例 IP 換成你自己的**，不然哪天自家流量被下面的規則掃到就把自己鎖在外面了。
+2. **Block Known Bad ASNs** — 壞 ASN 黑名單（這條的 expression 每次跑會被腳本自動重寫，手改沒用）。
+3. **Allow Essential Legitimate Services** — 放行 Googlebot、UptimeRobot 這類。
+4. **Block Malicious Traffic & Exploit Probes** — 擋掃描工具 UA + 漏洞路徑。
+5. **Challenge High Threat Score Traffic** — 高威脅分數丟 managed challenge。
+
+`skip` 規則可以加 `skip_current_ruleset: true`（跳過後面所有 custom rules）跟 `products`（跳過哪些受管產品）。
+
+> 小提醒：**別用「挑戰所有海外流量」那種國家規則**。如果你的站是 SPA + API，managed challenge 會卡死前端的 XHR / preflight，海外用戶直接進不來。用 `threat_score` 之類比較安全。
+
+## 本機先看 plan（建議）
+
+別讓 CI 盲 apply 到正式站，先本機看一次 diff：
 
 ```bash
-git add terraform.tfvars
-git commit -m "Update zone IDs"
-git push origin main
+export TF_VAR_cloudflare_api_token="你的token"   # 只在你終端機，別貼出去
+python update_abuseipdb_asns.py
+terraform init
+while IFS=$'\t' read -r a id; do terraform import "$a" "$id"; done < import_targets.txt
+terraform plan    # 確認是 in-place、沒有 destroy/recreate
 ```
 
-### 5. View GitHub Actions
+plan 乾淨再 `terraform apply` 或 merge。
 
-After committing, GitHub Actions will automatically run and deploy the WAF rules. You can view the progress in the Actions tab of your repository.
+## 卡關時
 
-## Automatic Updates
-
-The WAF rules will be updated automatically in the following ways:
-
-- Whenever you push to the main branch
-- Daily at 3:00 AM (UTC) via a scheduled task
-
-## 🛡️ Built-in Rule Categories
-
-The WAF rules are organized into three priority levels:
-
-### 1. **Allow Legitimate Security & Monitoring Services** (Highest Priority)
-- **Expanse (Palo Alto Networks)** - Network asset discovery
-- **Shodan, Censys** - Internet-wide scanning services
-- **Monitoring Services** - UptimeRobot, Pingdom, StatusCake, Site24x7
-- **Performance Testing** - GTmetrix, PageSpeed Insights, Lighthouse, WebPageTest
-
-### 2. **Allow Known Bots & Crawlers** (Second Priority)
-- **Search Engines** - Google, Bing, Yahoo, DuckDuckGo, Baidu, Yandex
-- **Social Media** - Facebook, Twitter, LinkedIn, WhatsApp, Discord, Telegram
-- **Other Services** - Apple Bot, Internet Archive
-
-### 3. **Block Malicious User-Agents** (Third Priority)
-- Attack tools (nmap, sqlmap, nikto, etc.)
-- Automated scanners and vulnerability tools
-- Suspicious or empty user agents
-
-### 4. **Block Exploit Path Probes**
-- Common attack paths (/.git, /.env, /wp-admin, etc.)
-- Configuration files and sensitive directories
-
-### 5. **Geographic and ASN Filtering**
-- Challenge overseas traffic (configurable)
-- Block known malicious ASNs from AbuseIPDB
-
-## Custom Rules
-
-If you want to add or modify WAF rules, edit the `rules.yaml` file. The file follows the format below:
-
-```yaml
-rules:
-- action: skip|block|managed_challenge|js_challenge|...
-  expression: <Cloudflare Filter Expression>
-  name: <Rule Name>
-  products:  # Required only if action is skip
-  - waf
-  - bic
-  - rateLimit
-```
-
-### Rule Examples
-
-1. **Block traffic from specific countries**:
-```yaml
-- action: block
-  expression: ip.geoip.country in {"RU" "IR" "KP"}
-  name: Block High Risk Countries
-```
-
-2. **Challenge suspicious user agents**:
-```yaml
-- action: managed_challenge
-  expression: http.user_agent contains "suspicious-string"
-  name: Challenge Suspicious User Agents
-```
-
-3. **Block specific IP ranges**:
-```yaml
-- action: block
-  expression: ip.src in {192.0.2.0/24 198.51.100.0/24}
-  name: Block Specific IP Ranges
-```
-
-### Rule Priority
-
-Rules are executed in the order they appear in the `rules.yaml` file. Rules listed earlier have higher priority.
-
-**Important**: The current rule order is optimized to:
-1. First allow legitimate services (security scanners, monitoring tools)
-2. Then allow search engines and social media crawlers
-3. Finally block malicious traffic and attack tools
-
-### Test Your Rules
-
-After adding new rules, it is recommended to test them on a single website first to confirm they work as expected before applying them to all websites.
-
-## 🔍 Monitoring and Analytics
-
-### Checking Rule Effectiveness
-You can monitor your WAF rules through:
-- **Cloudflare Dashboard** → Security → WAF → Custom rules
-- **Analytics** → Security → WAF events
-- **Logs** → HTTP requests (Enterprise plan)
-
-### Common Legitimate Services to Monitor
-If you notice these services being blocked, they should be added to the allow list:
-- Security scanners (Qualys, Rapid7, etc.)
-- SEO tools (Ahrefs, SEMrush, Moz, etc.)
-- Monitoring services (New Relic, Datadog, etc.)
-- Performance testing tools
-
-### Cloudflare Expression Syntax
-
-Cloudflare uses a specific expression syntax to define rules. For detailed syntax, refer to the [Cloudflare Filter Expressions documentation](https://developers.cloudflare.com/ruleset-engine/rules-language/expressions/).
-
-## Troubleshooting
-
-If you encounter issues, check:
-
-1. Whether the Cloudflare API Token has the correct permissions
-2. Whether the Zone ID is correct
-3. Error messages in the GitHub Actions logs
-
-### Common Issues
-
-**Legitimate services being blocked:**
-- Check if the service's user agent is in the allow list
-- Add the service to the first rule in `rules.yaml`
-- Monitor WAF events to identify blocked legitimate traffic
-
-**SEO impact concerns:**
-- All major search engines are whitelisted by default
-- Social media preview crawlers are supported
-- Performance testing tools are allowed
-
-**False positives:**
-- Review the WAF events in Cloudflare Dashboard
-- Adjust rules based on your specific needs
-- Consider using `managed_challenge` instead of `block` for borderline cases
-
-## Security Best Practices
-
-### API Token Security
-- ✅ **Correct**: Store the Cloudflare API Token in GitHub Secrets
-- ✅ **Correct**: Pass it to Terraform via the environment variable `TF_VAR_cloudflare_api_token`
-- ❌ **Incorrect**: Hardcode the API Token in `terraform.tfvars` or any code file
-- ❌ **Incorrect**: Commit files containing the API Token to version control
-
-### Zone ID Security
-- ✅ Zone ID is not sensitive information and can be safely stored in `terraform.tfvars`
-- ✅ Zone ID can be committed to version control
-
-### Local Development
-If you need to run Terraform locally:
-```bash
-export TF_VAR_cloudflare_api_token="your_api_token_here"
-terraform plan
-terraform apply
-```
-
-## 📋 Notes
-
-- This tool will delete and recreate existing WAF rulesets whose names contain "Terraform", "WAF", or "managed".
-- Please ensure you understand the impact of the rules you apply on your website.
-- The rules are optimized for balancing security and accessibility for legitimate services.
-- Regular monitoring of WAF events is recommended to fine-tune the rules.
-
-## 🤝 Contributing
-
-If you find legitimate services being blocked or have suggestions for improving the rules, please:
-1. Open an issue with details about the blocked service
-2. Include the user agent string and service purpose
-3. Submit a pull request with the proposed changes
-
-## 📄 License
-
-This project is open source and available under the [MIT License](LICENSE).
+- apply 403 `code 10000`：多半不是 token 壞，是 tfvars 裡有 zone **不在這把 token 的帳號**底下 → 拿掉那個 zone。
+- token 到底活不活：`curl -s https://api.cloudflare.com/client/v4/user/tokens/verify -H "Authorization: Bearer $TF_VAR_cloudflare_api_token"`
+- 正常服務被擋：把它的 UA 加進第三條 `Allow Essential Legitimate Services`。

@@ -18,6 +18,10 @@ def load_zone_ids_from_tfvars():
         # 簡單解析 terraform.tfvars 中的 zone_ids
         import re
 
+        # 先剝掉註解（# 之後到行尾），否則被註解掉的 zone 仍會被下面的 regex 撈到，
+        # 與 terraform 實際納管的 zone 不一致（terraform 會正確忽略註解）。
+        content = re.sub(r'#.*', '', content)
+
         # 匹配 zone_ids 區塊
         zone_block_pattern = r'zone_ids\s*=\s*\{([^}]+)\}'
         zone_block_match = re.search(zone_block_pattern, content, re.DOTALL)
@@ -266,26 +270,44 @@ def fetch_abuseipdb_asns():
         return get_known_bad_asns()[:MAX_ASNS]
 
 def update_rules_yaml(asns):
+    """就地更新 ASN block 規則的 expression，保留規則順序與其他規則不動。
+
+    重要：不可像舊版那樣「移除後 insert(0)」——那會把 ASN 規則插到最前面，
+    壓過最高優先的「Allow EZLO Self Infrastructure」skip 規則，導致自家流量
+    在 skip 生效前就被 ASN 規則攔下（會把自家/白名單流量也擋掉）。
+    """
+    if not asns:
+        print("⚠️  No ASN data available, leaving existing ASN rule untouched")
+        return
+
     with open(OUTPUT_FILE, 'r') as f:
         data = yaml.safe_load(f)
 
-    # 移除現有的 ASN 規則
-    data["rules"] = [rule for rule in data["rules"] if "ASN" not in rule["name"]]
+    new_expression = f"(ip.geoip.asnum in {{{' '.join(map(str, asns))}}})"
 
-    # 只有在有 ASN 數據時才添加新規則
-    if asns:
-        rule_block = {
+    asn_rule_found = False
+    for rule in data["rules"]:
+        if "ASN" in rule.get("name", ""):
+            rule["expression"] = new_expression
+            asn_rule_found = True
+            print(f"✏️  Updated ASN rule expression in place with {len(asns)} ASNs")
+            break
+
+    # 找不到既有 ASN 規則才新增（放在第一個 block 規則的位置：跳過開頭的 skip 規則）
+    if not asn_rule_found:
+        insert_at = next(
+            (i for i, r in enumerate(data["rules"]) if r.get("action") != "skip"),
+            len(data["rules"]),
+        )
+        data["rules"].insert(insert_at, {
             "name": "Block Known Bad ASNs (AbuseIPDB)",
             "action": "block",
-            "expression": f"(ip.geoip.asnum in {{{' '.join(map(str, asns))}}})"
-        }
-        data["rules"].insert(0, rule_block)
-        print(f"Added ASN blocking rule with {len(asns)} ASNs at highest priority")
-    else:
-        print("No ASN data available, skipping ASN rule creation")
+            "expression": new_expression,
+        })
+        print(f"➕ Inserted new ASN rule at index {insert_at} with {len(asns)} ASNs")
 
     with open(OUTPUT_FILE, 'w') as f:
-        yaml.dump(data, f)
+        yaml.dump(data, f, sort_keys=False, allow_unicode=True)
 
 def get_zone_rulesets(zone_id):
     """獲取指定 zone 的所有 ruleset"""
@@ -307,93 +329,57 @@ def get_zone_rulesets(zone_id):
         print(f"Error fetching rulesets for zone {zone_id}: {e}")
         return []
 
-def delete_ruleset(zone_id, ruleset_id, ruleset_name):
-    """刪除指定的 ruleset"""
+IMPORT_TARGETS_FILE = "import_targets.txt"
+
+def emit_import_targets():
+    """探查每個 zone 現有的 http_request_firewall_custom (kind=zone) ruleset id，
+    寫出 terraform import 目標到 IMPORT_TARGETS_FILE，供 workflow 在 apply 前把現有
+    ruleset import 進當次 state，達成 in-place update（零無防護空窗）。
+
+    取代舊版 cleanup_existing_rulesets() 的「先 DELETE 再重建」——後者每次跑都有
+    短暫無 custom WAF 的空窗、且會抹掉任何手動規則。改成 import 後純 in-place 更新。
+
+    每行格式：  <terraform_address>\t<import_id>
+    例：       cloudflare_ruleset.waf_ruleset["example.com"]\tzones/<zone_id>/<ruleset_id>
+
+    某 zone 若還沒有 entry point ruleset（全新 zone），就不寫該行 → terraform 會自行 create。
+    """
+    # 每次重寫，避免殘留上次的目標
+    open(IMPORT_TARGETS_FILE, "w").close()
+
     if not CLOUDFLARE_API_TOKEN:
-        print("Warning: CLOUDFLARE_API_TOKEN not found, skipping ruleset deletion")
-        return False
-
-    headers = {
-        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/rulesets/{ruleset_id}"
-    try:
-        print(f"    🗑️  Attempting to delete ruleset: {ruleset_name} (ID: {ruleset_id})")
-        response = requests.delete(url, headers=headers)
-        response.raise_for_status()  # 會在 HTTP 錯誤時拋出異常
-        print(f"    ✅ Successfully deleted ruleset: {ruleset_name}")
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"    ❌ Failed to delete ruleset {ruleset_name}: {e}")
-        return False
-
-def cleanup_existing_rulesets():
-    """清理現有的 ruleset，確保沒有衝突"""
-    if not CLOUDFLARE_API_TOKEN:
-        print("⚠️ Skipping ruleset cleanup - no Cloudflare API token")
-        print("   This may cause conflicts if rulesets already exist")
+        print("⚠️ No Cloudflare API token — skipping import-target discovery")
+        print("   terraform 會嘗試 create；若 zone 已有 ruleset 會衝突。請設定 TF_VAR_cloudflare_api_token")
         return
 
-    print("\n🔍 Cleaning up existing rulesets to prevent conflicts...")
-
-    # 檢查是否有提供 zone_ids
     if not ZONE_IDS:
-        print("❌ No zone IDs loaded from terraform.tfvars")
-        print("   Please ensure terraform.tfvars contains valid zone_ids configuration")
-        print("   Example format:")
-        print("   zone_ids = {")
-        print('     "example.com" = "zone_id_here"')
-        print("   }")
+        print("❌ No zone IDs loaded from terraform.tfvars — nothing to discover")
         return
 
-    cleanup_success = True
-
+    print("\n🔍 Discovering existing entry-point rulesets for in-place import...")
+    lines = []
     for zone_name, zone_id in ZONE_IDS.items():
         print(f"\n📍 Zone: {zone_name} ({zone_id})")
-
-        try:
-            # 獲取所有 ruleset
-            rulesets = get_zone_rulesets(zone_id)
-            if not rulesets:
-                print("  ✅ No rulesets found or unable to fetch rulesets")
-                continue
-
-            # 找出所有需要清理的 ruleset
-            custom_firewall_rulesets = [
-                rs for rs in rulesets
-                if rs.get("phase") == "http_request_firewall_custom" and rs.get("kind") == "zone"
-            ]
-
-            if not custom_firewall_rulesets:
-                print("  ✅ No custom WAF rulesets found")
-                continue
-
-            print(f"  📋 Found {len(custom_firewall_rulesets)} custom WAF ruleset(s):")
-
-            # 刪除所有 http_request_firewall_custom 階段的 ruleset
-            for ruleset in custom_firewall_rulesets:
-                ruleset_name = ruleset.get('name', 'Unknown')
-                ruleset_id = ruleset.get('id')
-
-                # 嘗試刪除所有 custom firewall ruleset
-                print(f"    🗑️  Deleting: {ruleset_name}")
-                success = delete_ruleset(zone_id, ruleset_id, ruleset_name)
-                if not success:
-                    cleanup_success = False
-                    print(f"    ⚠️  Failed to delete {ruleset_name}, but continuing...")
-
-        except Exception as e:
-            print(f"  ❌ Error processing zone {zone_name}: {e}")
-            cleanup_success = False
+        rulesets = get_zone_rulesets(zone_id)
+        entry_points = [
+            rs for rs in rulesets
+            if rs.get("phase") == "http_request_firewall_custom" and rs.get("kind") == "zone"
+        ]
+        if not entry_points:
+            print("  ➕ No existing entry-point ruleset — terraform will create it")
             continue
 
-    if cleanup_success:
-        print("\n✅ Ruleset cleanup completed successfully")
-    else:
-        print("\n⚠️ Ruleset cleanup completed with some errors")
-        print("   Terraform may encounter conflicts, but will attempt to proceed")
+        ruleset_id = entry_points[0]["id"]
+        address = f'cloudflare_ruleset.waf_ruleset["{zone_name}"]'
+        import_id = f"zones/{zone_id}/{ruleset_id}"
+        lines.append(f"{address}\t{import_id}")
+        print(f"  📌 Import target: {address}  ->  {import_id}")
+
+    with open(IMPORT_TARGETS_FILE, "w") as f:
+        f.write("\n".join(lines))
+        if lines:
+            f.write("\n")
+    print(f"\n📝 Wrote {len(lines)} import target(s) to {IMPORT_TARGETS_FILE}")
 
 def verify_api_tokens():
     """驗證 API Token 是否有效"""
@@ -435,8 +421,8 @@ if __name__ == "__main__":
     # 驗證 API Token
     verify_api_tokens()
 
-    # 首先清理現有的 ruleset
-    cleanup_existing_rulesets()
+    # 探查現有 ruleset，寫出 terraform import 目標（取代舊的 delete-then-recreate）
+    emit_import_targets()
 
     print("\n📊 Fetching AbuseIPDB ASN blacklist...")
     asns = fetch_abuseipdb_asns()
