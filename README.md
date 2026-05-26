@@ -1,70 +1,73 @@
-# Cloudflare WAF 自動更新（Terraform + AbuseIPDB）
+# Cloudflare WAF Auto-Update (Terraform + AbuseIPDB)
 
-用 GitHub Actions 自動幫你的 Cloudflare zone 維護一組 WAF custom rules。
-每天從 AbuseIPDB 抓壞 ASN 更新黑名單，順便放行搜尋引擎 / 監控這類正常服務。
-多個 zone 可以一起管，規則寫在一個 `rules.yaml` 裡。
+English | [繁體中文](./README_zh-TW.md) | [简体中文](./README_zh-CN.md)
 
-## 它怎麼跑
+GitHub Actions keeps a set of Cloudflare WAF custom rules in sync for your zones.
+It pulls bad ASNs from AbuseIPDB daily to refresh the blocklist, while allowing
+normal traffic like search engines and uptime monitors. Manage multiple zones
+from a single `rules.yaml`.
 
-GitHub Actions（每天 03:00 UTC + push main + 手動）會做這幾步：
+## How it works
 
-1. `update_abuseipdb_asns.py` → 更新 `rules.yaml` 的 ASN 清單，順便查出每個 zone 現有的 ruleset id 寫進 `import_targets.txt`
-2. `terraform import` → 把現有 ruleset 拉進 state
-3. `terraform apply` → **in-place 更新**，不會砍掉重建，所以沒有「中間一段沒防護」的空窗
+GitHub Actions (daily at 03:00 UTC + on push to main + manual dispatch) runs:
 
-> 早期版本是「先 DELETE 整個 ruleset 再重建」，每天都有短暫空窗、還會把手動改的規則洗掉。現在改成 import → apply，乾淨很多。
+1. `update_abuseipdb_asns.py` — refreshes the ASN list in `rules.yaml`, and discovers each zone's existing ruleset id into `import_targets.txt`
+2. `terraform import` — pulls the existing ruleset into state
+3. `terraform apply` — **in-place update**, no destroy/recreate, so there's no window where the zone is left unprotected
 
-## 怎麼用
+> The earlier version did "DELETE the whole ruleset, then recreate". That left a brief unprotected gap on every run and wiped any manual edits. Import → apply is much cleaner.
 
-**1. Fork 這個 repo。**
+## Usage
 
-**2. 設兩個 GitHub Secret**（Settings → Secrets and variables → Actions）：
+**1. Fork this repo.**
 
-| Name | 要幹嘛 |
+**2. Set two GitHub Secrets** (Settings → Secrets and variables → Actions):
+
+| Name | What it's for |
 |---|---|
-| `CLOUDFLARE_API_TOKEN` | **Zone : WAF : Edit** 權限的 API Token。一把 token 只能管它所屬帳號的 zone，別放別帳號的進來。Client IP filtering 留空，不然會擋到 runner。 |
-| `ABUSEIPDB_API_KEY` | 選用。沒設就用內建的靜態 ASN 清單，功能照常。 |
+| `CLOUDFLARE_API_TOKEN` | API Token with **Zone : WAF : Edit**. A token can only manage zones in the account it belongs to — don't add zones from another account. Leave Client IP filtering empty, or it'll block the runner. |
+| `ABUSEIPDB_API_KEY` | Optional. Without it the script falls back to a built-in static ASN list; everything else still works. |
 
-**3. 改 `terraform.tfvars`**，填你自己的 zone（域名 = zone id，dashboard 該網域 Overview 右下角找得到）：
+**3. Edit `terraform.tfvars`** with your own zones (domain = zone id; find the zone id at the bottom-right of the domain's Overview page in the CF dashboard):
 
 ```hcl
 zone_ids = {
-  "yourdomain.com" = "你的zone_id"
+  "yourdomain.com" = "your_zone_id"
 }
 ```
 
-**4. push 上去**，Actions 會自己跑。也可以去 Actions 頁手動 dispatch。
+**4. Push it.** Actions runs automatically. You can also dispatch it manually from the Actions tab.
 
-## 改規則
+## Editing rules
 
-全部在 `rules.yaml`，由上到下就是優先順序。預設五條：
+Everything lives in `rules.yaml`; top-to-bottom is the priority order. Five rules by default:
 
-1. **Allow Trusted Infrastructure** — 放行你自己的 IP（server / CI / 監控）。**先把這條的範例 IP 換成你自己的**，不然哪天自家流量被下面的規則掃到就把自己鎖在外面了。
-2. **Block Known Bad ASNs** — 壞 ASN 黑名單（這條的 expression 每次跑會被腳本自動重寫，手改沒用）。
-3. **Allow Essential Legitimate Services** — 放行 Googlebot、UptimeRobot 這類。
-4. **Block Malicious Traffic & Exploit Probes** — 擋掃描工具 UA + 漏洞路徑。
-5. **Challenge High Threat Score Traffic** — 高威脅分數丟 managed challenge。
+1. **Allow Trusted Infrastructure** — allow your own IPs (server / CI / monitoring). **Replace the example IPs with your own first** — otherwise the day your own traffic gets caught by the rules below, you lock yourself out.
+2. **Block Known Bad ASNs** — bad-ASN blocklist (this rule's expression is rewritten by the script on every run, so editing it by hand is pointless).
+3. **Allow Essential Legitimate Services** — allow Googlebot, UptimeRobot, etc.
+4. **Block Malicious Traffic & Exploit Probes** — block scanner UAs + exploit paths.
+5. **Challenge High Threat Score Traffic** — managed challenge for high threat scores.
 
-`skip` 規則可以加 `skip_current_ruleset: true`（跳過後面所有 custom rules）跟 `products`（跳過哪些受管產品）。
+A `skip` rule can take `skip_current_ruleset: true` (skip all remaining custom rules) and `products` (which managed products to skip).
 
-> 小提醒：**別用「挑戰所有海外流量」那種國家規則**。如果你的站是 SPA + API，managed challenge 會卡死前端的 XHR / preflight，海外用戶直接進不來。用 `threat_score` 之類比較安全。
+> Heads-up: **don't use a "challenge all overseas traffic" country rule**. If your site is a SPA + API, a managed challenge breaks the frontend's XHR / preflight and locks out overseas users entirely. Use something like `threat_score` instead.
 
-## 本機先看 plan（建議）
+## Review the plan locally first (recommended)
 
-別讓 CI 盲 apply 到正式站，先本機看一次 diff：
+Don't let CI blindly apply to a live site — eyeball the diff once:
 
 ```bash
-export TF_VAR_cloudflare_api_token="你的token"   # 只在你終端機，別貼出去
+export TF_VAR_cloudflare_api_token="your_token"   # in your terminal only, don't paste it anywhere
 python update_abuseipdb_asns.py
 terraform init
 while IFS=$'\t' read -r a id; do terraform import "$a" "$id"; done < import_targets.txt
-terraform plan    # 確認是 in-place、沒有 destroy/recreate
+terraform plan    # confirm it's in-place, no destroy/recreate
 ```
 
-plan 乾淨再 `terraform apply` 或 merge。
+If the plan is clean, `terraform apply` or merge.
 
-## 卡關時
+## Troubleshooting
 
-- apply 403 `code 10000`：多半不是 token 壞，是 tfvars 裡有 zone **不在這把 token 的帳號**底下 → 拿掉那個 zone。
-- token 到底活不活：`curl -s https://api.cloudflare.com/client/v4/user/tokens/verify -H "Authorization: Bearer $TF_VAR_cloudflare_api_token"`
-- 正常服務被擋：把它的 UA 加進第三條 `Allow Essential Legitimate Services`。
+- **apply 403 `code 10000`**: usually not a bad token — it's a zone in `tfvars` that **isn't in this token's account**. Remove that zone.
+- **Is the token alive?** `curl -s https://api.cloudflare.com/client/v4/user/tokens/verify -H "Authorization: Bearer $TF_VAR_cloudflare_api_token"`
+- **Legit service getting blocked**: add its UA to rule 3, `Allow Essential Legitimate Services`.
